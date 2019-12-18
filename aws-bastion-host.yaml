@@ -1,0 +1,214 @@
+#---------------------------------------------------------------
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# --------------------------------------------------------------
+# CloudFormation Cheap High Available Bastion-host template.
+# Resources:  1 SecurityGroup, 1 ManagedPolicy, 1 IAMRole, 1 InstanceProfile,
+# 1 AutoScalingGroup, 1 LaunchConfiguration, 1 EIP.
+# --------------------------------------------------------------
+# Author: Janos Versler
+#
+# Version    Date      Info
+# 1.0       2019.12    Cheap High Available Bastion-host
+# --------------------------------------------------------------
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: "Cheap High Available Bastion-host"
+
+Metadata:
+  LICENSE: Apache License, Version 2.0
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VPCID
+          - Subnets
+
+      - Label:
+          default: "Bastion Host Configuration"
+        Parameters:
+          - AMIname
+          - InstanceType
+          - KeyName
+
+
+Parameters:
+  VPCID:
+    Type: 'AWS::EC2::VPC::Id'
+
+  Subnets:
+    Type: 'List<AWS::EC2::Subnet::Id>'
+
+
+#  Uncomment this line to be able pass your AMI ID manually.
+#  AMIname:
+#    Type: 'String'
+#    Default: PasteHereYourGoldenAMI_ID
+#  And comment the 3 lines below.
+
+# This configuration will take the latest AMI ID from AWS SSM parameter store.
+  AMIname:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+
+  InstanceType:
+    Type: 'String'
+    Description: EC2 instance types for Bastion Host
+    Default: 't2.micro'
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t2.large
+
+  KeyName:
+    Type: 'AWS::EC2::KeyPair::KeyName'
+
+
+Resources:
+#========== Security Group ==========
+  BastionSG:
+      Type: 'AWS::EC2::SecurityGroup'
+      Properties:
+        GroupDescription: BastionSG
+        GroupName: SSH and ICMP for BastionHost
+        VpcId: !Ref VPCID
+        SecurityGroupIngress:
+            - IpProtocol: tcp
+              FromPort: 22
+              ToPort: 22
+              CidrIp: 0.0.0.0/0
+            - IpProtocol: icmp
+              FromPort: -1
+              ToPort: -1
+              CidrIp: 0.0.0.0/0
+        Tags:
+          - Key: Name
+            Value: BastionHostSG
+          - Key: Purpose
+            Value: ResilentBastionHost
+
+#========== Managed IAM Policy ==========
+  BastionAIMPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: BastionAIMPolicy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Resource: "*"
+            Action:
+              - "ec2:AssociateAddress"
+
+#========== IAM Role ==========
+  BastionIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: BastionIAMRole
+      Description: BastionHost IAM role for EIP
+      ManagedPolicyArns:
+        - !Ref BastionAIMPolicy
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Tags:
+        - Key: Name
+          Value: BastionIAMRole
+        - Key: Purpose
+          Value: ResilentBastionHost
+
+#========== Instance Profile ==========
+  BastionInstanceProfile:
+    Type : AWS::IAM::InstanceProfile
+    Properties :
+      InstanceProfileName: BastionInstanceProfile
+      Roles:
+        - !Ref BastionIAMRole
+
+#========== Launch Configuration ==========
+  BastionLC:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    DependsOn : BastionEIP
+    Properties:
+      SecurityGroups:
+        - !Ref BastionSG
+      IamInstanceProfile: !Ref BastionInstanceProfile
+      ImageId: !Ref AMIname
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash -xe
+            yum update -y aws-cfn-bootstrap
+            aws configure set default.region $(curl http://169.254.169.254/latest/dynamic/instance-identity/document|grep region|awk -F\" '{print $4}')
+            aws ec2 associate-address --instance-id $(curl -s http://169.254.169.254/latest/meta-data/instance-id) --allocation-id ${BastionEIP.AllocationId}
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource AutoScalingGroup --region ${AWS::Region}
+
+#========== Auto Scaling Group ==========
+  BastionASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn : BastionSG
+    Properties:
+      Cooldown: '5'
+      LaunchConfigurationName: !Ref BastionLC
+      DesiredCapacity: '1'
+      MinSize: '1'
+      MaxSize: '1'
+      VPCZoneIdentifier: !Ref Subnets
+      Tags:
+        - Key: Name
+          PropagateAtLaunch: "true"
+          Value: BastionHost
+        - Key: Purpose
+          PropagateAtLaunch: "true"
+          Value: ResilentBastionHost
+
+#========== Elastic IP ==========
+  BastionEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: !Ref VPCID
+      Tags:
+        - Key: Name
+          Value: BastionHostEIP
+        - Key: Purpose
+          Value: ResilentBastionHost
+
+
+#========== OUTPUTS ==========
+Outputs:
+
+  BastionVPCID:
+    Description: Bastion Host VPC ID
+    Value: !Ref 'VPCID'
+
+  InstanceEIP:
+    Description: Bastion Host Elastic IP
+    Value: !Ref 'BastionEIP'
+
+  InstanceType:
+    Description: Bastion Host Instance Type
+    Value: !Ref 'InstanceType'
+
+  SelectedKeyName:
+    Description: Bastion Host SSH Key Name
+    Value: !Ref 'KeyName'
+
